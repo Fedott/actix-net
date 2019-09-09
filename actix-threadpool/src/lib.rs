@@ -3,10 +3,12 @@
 use std::fmt;
 
 use derive_more::Display;
-use futures::sync::oneshot;
-use futures::{Async, Future, Poll};
+use futures::channel::oneshot;
+use futures::{Future, Poll};
 use parking_lot::Mutex;
 use threadpool::ThreadPool;
+use futures::task::Context;
+use std::pin::Pin;
 
 /// Env variable for default cpu pool size
 const ENV_CPU_POOL_VAR: &str = "ACTIX_THREADPOOL";
@@ -75,14 +77,20 @@ pub struct CpuFuture<I, E> {
 }
 
 impl<I, E: fmt::Debug> Future for CpuFuture<I, E> {
-    type Item = I;
-    type Error = BlockingError<E>;
+    type Output = Result<I, BlockingError<E>>;
 
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        let res = futures::try_ready!(self.rx.poll().map_err(|_| BlockingError::Canceled));
-        match res {
-            Ok(val) => Ok(Async::Ready(val)),
-            Err(err) => Err(BlockingError::Error(err)),
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        use std::task::Poll::*;
+
+        match Pin::new(&mut self.rx).poll(cx) {
+            Ready(Ok(v)) => {
+                match v {
+                    Ok(v) => Ready(Ok(v)),
+                    Err(e) => Ready(Err(BlockingError::Error(e))),
+                }
+            },
+            Ready(Err(_)) => Ready(Err(BlockingError::Canceled)),
+            Pending => Pending,
         }
     }
 }

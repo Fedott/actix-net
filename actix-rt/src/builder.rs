@@ -3,11 +3,11 @@ use std::io;
 
 use futures::future;
 use futures::future::{lazy, Future};
-use futures::sync::mpsc::unbounded;
-use futures::sync::oneshot::{channel, Receiver};
+use futures::channel::mpsc::unbounded;
+use futures::channel::oneshot::{channel, Receiver};
 
-use tokio_current_thread::{CurrentThread, Handle};
-use tokio_reactor::Reactor;
+use tokio_executor::current_thread::{CurrentThread, Handle};
+use tokio_net::driver::Reactor;
 use tokio_timer::clock::Clock;
 use tokio_timer::timer::Timer;
 
@@ -118,7 +118,7 @@ impl Builder {
         rt.spawn(arb);
 
         // init system arbiter and run configuration method
-        let _ = rt.block_on(lazy(move || {
+        let _ = rt.block_on(lazy(move |_| {
             f();
             Ok::<_, ()>(())
         }));
@@ -159,13 +159,14 @@ pub(crate) struct AsyncSystemRunner {
 impl AsyncSystemRunner {
     /// This function will start event loop and returns a future that
     /// resolves once the `System::stop()` function is called.
-    pub(crate) fn run_nonblocking(self) -> impl Future<Item = (), Error = io::Error> + Send {
+    pub(crate) fn run_nonblocking(self) -> impl Future<Output=Result<(),io::Error>> + Send {
         let AsyncSystemRunner { stop, .. } = self;
 
         // run loop
-        future::lazy(|| {
+        async {
             Arbiter::run_system();
-            stop.then(|res| match res {
+            let res = stop.await;
+            let res = match res {
                 Ok(code) => {
                     if code != 0 {
                         Err(io::Error::new(
@@ -177,12 +178,10 @@ impl AsyncSystemRunner {
                     }
                 }
                 Err(e) => Err(io::Error::new(io::ErrorKind::Other, e)),
-            })
-            .then(|result| {
-                Arbiter::stop_system();
-                result
-            })
-        })
+            };
+            Arbiter::stop_system();
+            res
+        }
     }
 }
 
@@ -202,7 +201,7 @@ impl SystemRunner {
         let SystemRunner { mut rt, stop, .. } = self;
 
         // run loop
-        let _ = rt.block_on(lazy(move || {
+        let _ = rt.block_on(lazy(move |_| {
             Arbiter::run_system();
             Ok::<_, ()>(())
         }));
@@ -226,14 +225,14 @@ impl SystemRunner {
     /// Execute a future and wait for result.
     pub fn block_on<F, I, E>(&mut self, fut: F) -> Result<I, E>
     where
-        F: Future<Item = I, Error = E>,
+        F: Future<Output = Result<I, E>>,
     {
-        let _ = self.rt.block_on(lazy(move || {
+        let _ = self.rt.block_on(lazy(move |_| {
             Arbiter::run_system();
             Ok::<_, ()>(())
         }));
         let res = self.rt.block_on(fut);
-        let _ = self.rt.block_on(lazy(move || {
+        let _ = self.rt.block_on(lazy(move |_| {
             Arbiter::stop_system();
             Ok::<_, ()>(())
         }));

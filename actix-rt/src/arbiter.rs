@@ -4,20 +4,22 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{fmt, thread};
 
-use futures::sync::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
-use futures::sync::oneshot::{channel, Canceled, Sender};
-use futures::{future, Async, Future, IntoFuture, Poll, Stream};
-use tokio_current_thread::spawn;
+use futures::channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
+use futures::channel::oneshot::{channel, Canceled, Sender};
+use futures::{future, Future, Poll, Stream, TryFuture, TryFutureExt};
+use tokio_executor::current_thread::spawn;
 
 use crate::builder::Builder;
 use crate::system::System;
 
 use copyless::BoxHelper;
+use std::pin::Pin;
+use std::task::Context;
 
 thread_local!(
     static ADDR: RefCell<Option<Arbiter>> = RefCell::new(None);
     static RUNNING: Cell<bool> = Cell::new(false);
-    static Q: RefCell<Vec<Box<dyn Future<Item = (), Error = ()>>>> = RefCell::new(Vec::new());
+    static Q: RefCell<Vec<Pin<Box<dyn Future<Output = ()>>>>> = RefCell::new(Vec::new());
     static STORAGE: RefCell<HashMap<TypeId, Box<dyn Any>>> = RefCell::new(HashMap::new());
 );
 
@@ -25,7 +27,7 @@ pub(crate) static COUNT: AtomicUsize = AtomicUsize::new(0);
 
 pub(crate) enum ArbiterCommand {
     Stop,
-    Execute(Box<dyn Future<Item = (), Error = ()> + Send>),
+    Execute(Pin<Box<dyn Future<Output = ()> + Send>>),
     ExecuteFn(Box<dyn FnExec>),
 }
 
@@ -143,13 +145,13 @@ impl Arbiter {
     /// thread.
     pub fn spawn<F>(future: F)
     where
-        F: Future<Item = (), Error = ()> + 'static,
+        F: Future<Output = ()> + 'static,
     {
         RUNNING.with(move |cell| {
             if cell.get() {
-                spawn(Box::alloc().init(future));
+                spawn(Pin::from(Box::alloc().init(future)));
             } else {
-                Q.with(move |cell| cell.borrow_mut().push(Box::alloc().init(future)));
+                Q.with(move |cell| cell.borrow_mut().push(Pin::from(Box::alloc().init(future))));
             }
         });
     }
@@ -157,22 +159,24 @@ impl Arbiter {
     /// Executes a future on the current thread. This does not create a new Arbiter
     /// or Arbiter address, it is simply a helper for executing futures on the current
     /// thread.
-    pub fn spawn_fn<F, R>(f: F)
-    where
-        F: FnOnce() -> R + 'static,
-        R: IntoFuture<Item = (), Error = ()> + 'static,
-    {
-        Arbiter::spawn(future::lazy(f))
-    }
+//    pub fn spawn_fn<F, R>(f: F)
+//    where
+//        F: FnOnce(&mut Context<'_>) -> R + 'static,
+//        R: Future<Output = ()> + 'static,
+//    {
+//        Arbiter::spawn(future::lazy(|cx| {
+//            f(cx)
+//        }))
+//    }
 
     /// Send a future to the Arbiter's thread, and spawn it.
     pub fn send<F>(&self, future: F)
     where
-        F: Future<Item = (), Error = ()> + Send + 'static,
+        F: Future<Output = ()> + Send + 'static,
     {
         let _ = self
             .0
-            .unbounded_send(ArbiterCommand::Execute(Box::new(future)));
+            .unbounded_send(ArbiterCommand::Execute(Box::pin(future)));
     }
 
     /// Send a function to the Arbiter's thread, and execute it. Any result from the function
@@ -191,7 +195,7 @@ impl Arbiter {
     /// Send a function to the Arbiter's thread. This function will be executed asynchronously.
     /// A future is created, and when resolved will contain the result of the function sent
     /// to the Arbiters thread.
-    pub fn exec<F, R>(&self, f: F) -> impl Future<Item = R, Error = Canceled>
+    pub fn exec<F, R>(&self, f: F) -> impl Future<Output=Result<R, Canceled>>
     where
         F: FnOnce() -> R + Send + 'static,
         R: Send + 'static,
@@ -269,19 +273,18 @@ impl Drop for ArbiterController {
 }
 
 impl Future for ArbiterController {
-    type Item = ();
-    type Error = ();
+    type Output = ();
 
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         loop {
-            match self.rx.poll() {
-                Ok(Async::Ready(None)) | Err(_) => return Ok(Async::Ready(())),
-                Ok(Async::Ready(Some(item))) => match item {
+            match Pin::new(&mut self.rx).poll_next(cx) {
+                Poll::Ready(None) => return Poll::Ready(()),
+                Poll::Ready(Some(item)) => match item {
                     ArbiterCommand::Stop => {
                         if let Some(stop) = self.stop.take() {
                             let _ = stop.send(0);
                         };
-                        return Ok(Async::Ready(()));
+                        return Poll::Ready(());
                     }
                     ArbiterCommand::Execute(fut) => {
                         spawn(fut);
@@ -290,7 +293,7 @@ impl Future for ArbiterController {
                         f.call_box();
                     }
                 },
-                Ok(Async::NotReady) => return Ok(Async::NotReady),
+                Poll::Pending => return Poll::Pending,
             }
         }
     }
@@ -321,14 +324,13 @@ impl SystemArbiter {
 }
 
 impl Future for SystemArbiter {
-    type Item = ();
-    type Error = ();
+    type Output = ();
 
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         loop {
-            match self.commands.poll() {
-                Ok(Async::Ready(None)) | Err(_) => return Ok(Async::Ready(())),
-                Ok(Async::Ready(Some(cmd))) => match cmd {
+            match Pin::new(&mut self.commands).poll_next(cx) {
+                Poll::Ready(None) => return Poll::Ready(()),
+                Poll::Ready(Some(item)) => match item {
                     SystemCommand::Exit(code) => {
                         // stop arbiters
                         for arb in self.arbiters.values() {
@@ -346,7 +348,7 @@ impl Future for SystemArbiter {
                         self.arbiters.remove(&name);
                     }
                 },
-                Ok(Async::NotReady) => return Ok(Async::NotReady),
+                Poll::Pending => return Poll::Pending,
             }
         }
     }
