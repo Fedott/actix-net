@@ -1,10 +1,12 @@
 use std::rc::Rc;
 use std::sync::Arc;
 
-use futures::{Async, Future, IntoFuture, Poll};
+use futures::{TryFuture, Poll};
 
 use crate::transform_err::{TransformFromErr, TransformMapInitErr};
-use crate::{IntoNewService, NewService, Service};
+use crate::{IntoNewService, NewService, Service, IntoTryFuture};
+use std::pin::Pin;
+use futures::task::Context;
 
 /// The `Transform` trait defines the interface of a Service factory. `Transform`
 /// is often implemented for middleware, defining how to construct a
@@ -32,7 +34,7 @@ pub trait Transform<S> {
     type InitError;
 
     /// The future response value.
-    type Future: Future<Item = Self::Transform, Error = Self::InitError>;
+    type Future: TryFuture<Ok = Self::Transform, Error = Self::InitError>;
 
     /// Creates and returns a new Service component, asynchronously
     fn new_transform(&self, service: S) -> Self::Future;
@@ -193,7 +195,7 @@ where
     fn new_service(&self, cfg: &S::Config) -> Self::Future {
         ApplyTransformFuture {
             t_cell: self.t.clone(),
-            fut_a: self.s.new_service(cfg).into_future(),
+            fut_a: self.s.new_service(cfg).into_try_future(),
             fut_t: None,
         }
     }
@@ -205,28 +207,31 @@ where
     T: Transform<S::Service, InitError = S::InitError>,
 {
     fut_a: S::Future,
-    fut_t: Option<<T::Future as IntoFuture>::Future>,
+    fut_t: Option<<T::Future as IntoTryFuture>::Future>,
     t_cell: Rc<T>,
 }
 
-impl<T, S> Future for ApplyTransformFuture<T, S>
+impl<T, S> TryFuture for ApplyTransformFuture<T, S>
 where
     S: NewService,
     T: Transform<S::Service, InitError = S::InitError>,
 {
-    type Item = T::Transform;
+    type Ok = T::Transform;
     type Error = T::InitError;
 
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+    fn try_poll(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Self::Ok, Self::Error>> {
         if self.fut_t.is_none() {
-            if let Async::Ready(service) = self.fut_a.poll()? {
-                self.fut_t = Some(self.t_cell.new_transform(service).into_future());
+            if let Poll::Ready(service) = self.fut_a.try_poll()? {
+                self.fut_t = Some(self.t_cell.new_transform(service?).into_try_future());
             }
         }
         if let Some(ref mut fut) = self.fut_t {
-            fut.poll()
+            fut.try_poll()
         } else {
-            Ok(Async::NotReady)
+            Poll::Pending
         }
     }
 }

@@ -1,15 +1,18 @@
 use std::marker::PhantomData;
 
-use futures::{Async, Future, IntoFuture, Poll};
+use futures::{Poll, TryFuture, Future};
 
 use super::{IntoNewService, IntoService, NewService, Service};
+use crate::IntoTryFuture;
+use std::pin::Pin;
+use futures::task::Context;
 
 /// Apply tranform function to a service
 pub fn apply_fn<T, F, In, Out, U>(service: U, f: F) -> Apply<T, F, In, Out>
 where
     T: Service,
     F: FnMut(In, &mut T) -> Out,
-    Out: IntoFuture,
+    Out: IntoTryFuture,
     Out::Error: From<T::Error>,
     U: IntoService<T>,
 {
@@ -21,7 +24,7 @@ pub fn new_apply_fn<T, F, In, Out, U>(service: U, f: F) -> ApplyNewService<T, F,
 where
     T: NewService,
     F: FnMut(In, &mut T::Service) -> Out + Clone,
-    Out: IntoFuture,
+    Out: IntoTryFuture,
     Out::Error: From<T::Error>,
     U: IntoNewService<T>,
 {
@@ -43,7 +46,7 @@ impl<T, F, In, Out> Apply<T, F, In, Out>
 where
     T: Service,
     F: FnMut(In, &mut T) -> Out,
-    Out: IntoFuture,
+    Out: IntoTryFuture,
     Out::Error: From<T::Error>,
 {
     /// Create new `Apply` combinator
@@ -74,20 +77,20 @@ impl<T, F, In, Out> Service for Apply<T, F, In, Out>
 where
     T: Service,
     F: FnMut(In, &mut T) -> Out,
-    Out: IntoFuture,
+    Out: IntoTryFuture,
     Out::Error: From<T::Error>,
 {
     type Request = In;
-    type Response = Out::Item;
+    type Response = Out::Ok;
     type Error = Out::Error;
     type Future = Out::Future;
 
-    fn poll_ready(&mut self) -> Poll<(), Self::Error> {
+    fn poll_ready(&mut self) -> Poll<Result<(), Self::Error>> {
         self.service.poll_ready().map_err(|e| e.into())
     }
 
     fn call(&mut self, req: In) -> Self::Future {
-        (self.f)(req, &mut self.service).into_future()
+        (self.f)(req, &mut self.service).into_try_future()
     }
 }
 
@@ -105,7 +108,7 @@ impl<T, F, In, Out> ApplyNewService<T, F, In, Out>
 where
     T: NewService,
     F: FnMut(In, &mut T::Service) -> Out + Clone,
-    Out: IntoFuture,
+    Out: IntoTryFuture,
     Out::Error: From<T::Error>,
 {
     /// Create new `ApplyNewService` new service instance
@@ -122,7 +125,7 @@ impl<T, F, In, Out> Clone for ApplyNewService<T, F, In, Out>
 where
     T: NewService + Clone,
     F: FnMut(In, &mut T::Service) -> Out + Clone,
-    Out: IntoFuture,
+    Out: IntoTryFuture,
 {
     fn clone(&self) -> Self {
         Self {
@@ -137,11 +140,11 @@ impl<T, F, In, Out> NewService for ApplyNewService<T, F, In, Out>
 where
     T: NewService,
     F: FnMut(In, &mut T::Service) -> Out + Clone,
-    Out: IntoFuture,
+    Out: IntoTryFuture,
     Out::Error: From<T::Error>,
 {
     type Request = In;
-    type Response = Out::Item;
+    type Response = Out::Ok;
     type Error = Out::Error;
 
     type Config = T::Config;
@@ -158,7 +161,7 @@ pub struct ApplyNewServiceFuture<T, F, In, Out>
 where
     T: NewService,
     F: FnMut(In, &mut T::Service) -> Out + Clone,
-    Out: IntoFuture,
+    Out: IntoTryFuture,
 {
     fut: T::Future,
     f: Option<F>,
@@ -169,7 +172,7 @@ impl<T, F, In, Out> ApplyNewServiceFuture<T, F, In, Out>
 where
     T: NewService,
     F: FnMut(In, &mut T::Service) -> Out + Clone,
-    Out: IntoFuture,
+    Out: IntoTryFuture,
 {
     fn new(fut: T::Future, f: F) -> Self {
         ApplyNewServiceFuture {
@@ -184,25 +187,27 @@ impl<T, F, In, Out> Future for ApplyNewServiceFuture<T, F, In, Out>
 where
     T: NewService,
     F: FnMut(In, &mut T::Service) -> Out + Clone,
-    Out: IntoFuture,
+    Out: IntoTryFuture,
     Out::Error: From<T::Error>,
 {
-    type Item = Apply<T::Service, F, In, Out>;
-    type Error = T::InitError;
+    type Output = Result<Apply<T::Service, F, In, Out>, T::InitError>;
 
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        if let Async::Ready(service) = self.fut.poll()? {
-            Ok(Async::Ready(Apply::new(service, self.f.take().unwrap())))
+    fn poll(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Self::Output> {
+        if let Poll::Ready(service) = self.fut.poll() {
+            Poll::Ready(Ok(Apply::new(service?, self.f.take().unwrap())))
         } else {
-            Ok(Async::NotReady)
+            Poll::Pending
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use futures::future::{ok, FutureResult};
-    use futures::{Async, Future, Poll};
+    use futures::future::{ok, Ready};
+    use futures::{Poll};
 
     use super::*;
     use crate::{IntoService, NewService, Service, ServiceExt};
@@ -213,10 +218,10 @@ mod tests {
         type Request = ();
         type Response = ();
         type Error = ();
-        type Future = FutureResult<(), ()>;
+        type Future = Ready<Result<(), ()>>;
 
-        fn poll_ready(&mut self) -> Poll<(), Self::Error> {
-            Ok(Async::Ready(()))
+        fn poll_ready(&mut self) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
         }
 
         fn call(&mut self, _: ()) -> Self::Future {
@@ -233,10 +238,9 @@ mod tests {
             .apply_fn(Srv, |req: &'static str, srv| {
                 srv.call(()).map(move |res| (req, res))
             });
-        assert!(srv.poll_ready().is_ok());
-        let res = srv.call("srv").poll();
-        assert!(res.is_ok());
-        assert_eq!(res.unwrap(), Async::Ready(("srv", ())));
+        assert!(srv.poll_ready().is_ready());
+        let res = srv.call("srv").try_poll();
+        assert_eq!(res, Poll::Ready(Ok(("srv", ()))));
     }
 
     #[test]
@@ -245,11 +249,10 @@ mod tests {
             || Ok::<_, ()>(Srv),
             |req: &'static str, srv| srv.call(()).map(move |res| (req, res)),
         );
-        if let Async::Ready(mut srv) = new_srv.new_service(&()).poll().unwrap() {
-            assert!(srv.poll_ready().is_ok());
-            let res = srv.call("srv").poll();
-            assert!(res.is_ok());
-            assert_eq!(res.unwrap(), Async::Ready(("srv", ())));
+        if let Poll::Ready(Ok(mut srv)) = new_srv.new_service(&()).try_poll() {
+            assert!(srv.poll_ready().is_ready());
+            let res = srv.call("srv").try_poll();
+            assert_eq!(res, Poll::Ready(Ok(("srv", ()))));
         } else {
             panic!()
         }

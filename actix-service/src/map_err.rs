@@ -1,8 +1,10 @@
 use std::marker::PhantomData;
 
-use futures::{Async, Future, Poll};
+use futures::{TryFuture, Poll};
 
 use super::{NewService, Service};
+use std::pin::Pin;
+use futures::task::Context;
 
 /// Service for the `map_err` combinator, changing the type of a service's
 /// error.
@@ -53,7 +55,7 @@ where
     type Error = E;
     type Future = MapErrFuture<A, F, E>;
 
-    fn poll_ready(&mut self) -> Poll<(), Self::Error> {
+    fn poll_ready(&mut self) -> Poll<Result<(), Self::Error>> {
         self.service.poll_ready().map_err(&self.f)
     }
 
@@ -81,16 +83,19 @@ where
     }
 }
 
-impl<A, F, E> Future for MapErrFuture<A, F, E>
+impl<A, F, E> TryFuture for MapErrFuture<A, F, E>
 where
     A: Service,
     F: Fn(A::Error) -> E,
 {
-    type Item = A::Response;
+    type Ok = A::Response;
     type Error = E;
 
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        self.fut.poll().map_err(&self.f)
+    fn try_poll(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Self::Ok, Self::Error>> {
+        self.fut.try_poll().map_err(&self.f)
     }
 }
 
@@ -175,29 +180,34 @@ where
     }
 }
 
-impl<A, F, E> Future for MapErrNewServiceFuture<A, F, E>
+impl<A, F, E> TryFuture for MapErrNewServiceFuture<A, F, E>
 where
     A: NewService,
     F: Fn(A::Error) -> E + Clone,
 {
-    type Item = MapErr<A::Service, F, E>;
+    type Ok = MapErr<A::Service, F, E>;
     type Error = A::InitError;
 
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        if let Async::Ready(service) = self.fut.poll()? {
-            Ok(Async::Ready(MapErr::new(service, self.f.clone())))
+    fn try_poll(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Self::Ok, Self::Error>> {
+        if let Poll::Ready(service) = self.fut.try_poll() {
+            Poll::Ready(Ok(MapErr::new(service?, self.f.clone())))
         } else {
-            Ok(Async::NotReady)
+            Poll::Pending
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use futures::future::{err, FutureResult};
+    use futures::future::{err, Ready};
 
     use super::*;
     use crate::{IntoNewService, NewService, Service, ServiceExt};
+
+    type FutureResult<I, E> = Ready<Result<I, E>>;
 
     struct Srv;
 
@@ -207,7 +217,7 @@ mod tests {
         type Error = ();
         type Future = FutureResult<(), ()>;
 
-        fn poll_ready(&mut self) -> Poll<(), Self::Error> {
+        fn poll_ready(&mut self) -> Poll<Result<(), Self::Error>> {
             Err(())
         }
 
@@ -220,26 +230,26 @@ mod tests {
     fn test_poll_ready() {
         let mut srv = Srv.map_err(|_| "error");
         let res = srv.poll_ready();
-        assert!(res.is_err());
-        assert_eq!(res.err().unwrap(), "error");
+        assert!(res.is_ready());
+        assert_eq!(res, Poll::Ready(Err("error")));
     }
 
     #[test]
     fn test_call() {
         let mut srv = Srv.map_err(|_| "error");
-        let res = srv.call(()).poll();
-        assert!(res.is_err());
-        assert_eq!(res.err().unwrap(), "error");
+        let res = srv.call(()).try_poll();
+        assert!(res.is_ready());
+        assert_eq!(res, Poll::Ready(Err("error")));
     }
 
     #[test]
     fn test_new_service() {
         let blank = || Ok::<_, ()>(Srv);
         let new_srv = blank.into_new_service().map_err(|_| "error");
-        if let Async::Ready(mut srv) = new_srv.new_service(&()).poll().unwrap() {
-            let res = srv.call(()).poll();
-            assert!(res.is_err());
-            assert_eq!(res.err().unwrap(), "error");
+        if let Poll::Ready(Ok(mut srv)) = new_srv.new_service(&()).try_poll() {
+            let res = srv.call(()).try_poll();
+            assert!(res.is_ready());
+            assert_eq!(res, Poll::Ready(Err("error")));
         } else {
             panic!()
         }

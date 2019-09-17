@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use futures::{Future, IntoFuture, Poll};
+use futures::{Poll, TryFuture};
 
 mod and_then;
 mod and_then_apply;
@@ -38,6 +38,7 @@ pub use self::transform::{apply_transform, IntoTransform, Transform};
 
 use self::and_then_apply::AndThenTransform;
 use self::and_then_apply_fn::{AndThenApply, AndThenApplyNewService};
+use futures::future::Ready;
 
 /// An asynchronous function from `Request` to a `Response`.
 pub trait Service {
@@ -51,7 +52,7 @@ pub trait Service {
     type Error;
 
     /// The future response value.
-    type Future: Future<Item = Self::Response, Error = Self::Error>;
+    type Future: TryFuture<Ok = Self::Response, Error = Self::Error>;
 
     /// Returns `Ready` when the service is able to process requests.
     ///
@@ -62,7 +63,7 @@ pub trait Service {
     /// This is a **best effort** implementation. False positives are permitted.
     /// It is permitted for the service to return `Ready` from a `poll_ready`
     /// call and the next invocation of `call` results in an error.
-    fn poll_ready(&mut self) -> Poll<(), Self::Error>;
+    fn poll_ready(&mut self) -> Poll<Result<(), Self::Error>>;
 
     /// Process the request and return the response asynchronously.
     ///
@@ -85,7 +86,7 @@ pub trait ServiceExt: Service {
     where
         Self: Sized,
         F: FnMut(Self::Response, &mut B) -> Out,
-        Out: IntoFuture,
+        Out: IntoTryFuture,
         Out::Error: Into<Self::Error>,
         B: Service<Error = Self::Error>,
         B1: IntoService<B>,
@@ -206,7 +207,7 @@ pub trait NewService {
     type InitError;
 
     /// The future of the `Service` instance.
-    type Future: Future<Item = Self::Service, Error = Self::InitError>;
+    type Future: TryFuture<Ok = Self::Service, Error = Self::InitError>;
 
     /// Create and return a new service value asynchronously.
     fn new_service(&self, cfg: &Self::Config) -> Self::Future;
@@ -233,7 +234,7 @@ pub trait NewService {
         B: NewService<Config = Self::Config, Error = Self::Error, InitError = Self::InitError>,
         I: IntoNewService<B>,
         F: FnMut(Self::Response, &mut B::Service) -> Out,
-        Out: IntoFuture,
+        Out: IntoTryFuture,
         Out::Error: Into<Self::Error>,
     {
         AndThenApplyNewService::new(self, service, f)
@@ -343,7 +344,7 @@ where
     type Error = S::Error;
     type Future = S::Future;
 
-    fn poll_ready(&mut self) -> Poll<(), S::Error> {
+    fn poll_ready(&mut self) -> Poll<Result<(), S::Error>> {
         (**self).poll_ready()
     }
 
@@ -361,7 +362,7 @@ where
     type Error = S::Error;
     type Future = S::Future;
 
-    fn poll_ready(&mut self) -> Poll<(), S::Error> {
+    fn poll_ready(&mut self) -> Poll<Result<(), S::Error>> {
         (**self).poll_ready()
     }
 
@@ -379,7 +380,7 @@ where
     type Error = S::Error;
     type Future = S::Future;
 
-    fn poll_ready(&mut self) -> Poll<(), S::Error> {
+    fn poll_ready(&mut self) -> Poll<Result<(), S::Error>> {
         self.borrow_mut().poll_ready()
     }
 
@@ -454,6 +455,35 @@ where
     T: NewService,
 {
     fn into_new_service(self) -> T {
+        self
+    }
+}
+
+type FutureResult<I, E> = Ready<Result<I, E>>;
+
+/// Class of types which can be converted into a future.
+///
+/// This trait is very similar to the `IntoIterator` trait and is intended to be
+/// used in a very similar fashion.
+pub trait IntoTryFuture {
+    /// The future that this type can be converted into.
+    type Future: TryFuture<Ok=Self::Ok, Error=Self::Error>;
+
+    /// The item that the future may resolve with.
+    type Ok;
+    /// The error that the future may resolve with.
+    type Error;
+
+    /// Consumes this object and produces a future.
+    fn into_try_future(self) -> Self::Future;
+}
+
+impl<F: TryFuture> IntoTryFuture for F {
+    type Future = F;
+    type Ok = F::Ok;
+    type Error = F::Error;
+
+    fn into_try_future(self) -> F {
         self
     }
 }

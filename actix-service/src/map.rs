@@ -1,8 +1,10 @@
 use std::marker::PhantomData;
 
-use futures::{Async, Future, Poll};
+use futures::{TryFuture, Poll};
 
 use super::{NewService, Service};
+use std::pin::Pin;
+use futures::task::Context;
 
 /// Service for the `map` combinator, changing the type of a service's response.
 ///
@@ -52,7 +54,7 @@ where
     type Error = A::Error;
     type Future = MapFuture<A, F, Response>;
 
-    fn poll_ready(&mut self) -> Poll<(), Self::Error> {
+    fn poll_ready(&mut self) -> Poll<Result<(), Self::Error>> {
         self.service.poll_ready()
     }
 
@@ -80,18 +82,21 @@ where
     }
 }
 
-impl<A, F, Response> Future for MapFuture<A, F, Response>
+impl<A, F, Response> TryFuture for MapFuture<A, F, Response>
 where
     A: Service,
     F: FnMut(A::Response) -> Response,
 {
-    type Item = Response;
+    type Ok = Response;
     type Error = A::Error;
 
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        match self.fut.poll()? {
-            Async::Ready(resp) => Ok(Async::Ready((self.f)(resp))),
-            Async::NotReady => Ok(Async::NotReady),
+    fn try_poll(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Self::Ok, Self::Error>> {
+        match self.fut.try_poll() {
+            Poll::Ready(resp) => Poll::Ready(Ok((self.f)(resp?))),
+            Poll::Pending => Poll::Pending,
         }
     }
 }
@@ -170,26 +175,29 @@ where
     }
 }
 
-impl<A, F, Res> Future for MapNewServiceFuture<A, F, Res>
+impl<A, F, Res> TryFuture for MapNewServiceFuture<A, F, Res>
 where
     A: NewService,
     F: FnMut(A::Response) -> Res,
 {
-    type Item = Map<A::Service, F, Res>;
+    type Ok = Map<A::Service, F, Res>;
     type Error = A::InitError;
 
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        if let Async::Ready(service) = self.fut.poll()? {
-            Ok(Async::Ready(Map::new(service, self.f.take().unwrap())))
+    fn try_poll(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Self::Ok, Self::Error>> {
+        if let Poll::Ready(service) = self.fut.try_poll() {
+            Ok(Poll::Ready(Map::new(service?, self.f.take().unwrap())))
         } else {
-            Ok(Async::NotReady)
+            Poll::Pending
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use futures::future::{ok, FutureResult};
+    use futures::future::{ok, Ready};
 
     use super::*;
     use crate::{IntoNewService, Service, ServiceExt};
@@ -199,10 +207,10 @@ mod tests {
         type Request = ();
         type Response = ();
         type Error = ();
-        type Future = FutureResult<(), ()>;
+        type Future = Ready<Result<(), ()>>;
 
-        fn poll_ready(&mut self) -> Poll<(), Self::Error> {
-            Ok(Async::Ready(()))
+        fn poll_ready(&mut self) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
         }
 
         fn call(&mut self, _: ()) -> Self::Future {
@@ -214,26 +222,26 @@ mod tests {
     fn test_poll_ready() {
         let mut srv = Srv.map(|_| "ok");
         let res = srv.poll_ready();
-        assert!(res.is_ok());
-        assert_eq!(res.unwrap(), Async::Ready(()));
+        assert!(res.is_ready());
+        assert_eq!(res, Poll::Ready(Ok(())));
     }
 
     #[test]
     fn test_call() {
         let mut srv = Srv.map(|_| "ok");
-        let res = srv.call(()).poll();
-        assert!(res.is_ok());
-        assert_eq!(res.unwrap(), Async::Ready("ok"));
+        let res = srv.call(()).try_poll();
+        assert!(res.is_ready());
+        assert_eq!(res, Poll::Ready(Ok("ok")));
     }
 
     #[test]
     fn test_new_service() {
         let blank = || Ok::<_, ()>(Srv);
         let new_srv = blank.into_new_service().map(|_| "ok");
-        if let Async::Ready(mut srv) = new_srv.new_service(&()).poll().unwrap() {
-            let res = srv.call(()).poll();
-            assert!(res.is_ok());
-            assert_eq!(res.unwrap(), Async::Ready("ok"));
+        if let Poll::Ready(Ok(mut srv)) = new_srv.new_service(&()).try_poll() {
+            let res = srv.call(()).try_poll();
+            assert!(res.is_ready());
+            assert_eq!(res, Poll::Ready(Ok("ok")));
         } else {
             panic!()
         }

@@ -1,7 +1,9 @@
-use futures::{Async, Future, Poll};
+use futures::{Poll, TryFuture, Future};
 
 use super::{IntoNewService, NewService, Service};
 use crate::cell::Cell;
+use std::pin::Pin;
+use futures::task::Context;
 
 /// Service for the `and_then` combinator, chaining a computation onto the end
 /// of another service which completes successfully.
@@ -45,12 +47,12 @@ where
     type Error = A::Error;
     type Future = AndThenFuture<A, B>;
 
-    fn poll_ready(&mut self) -> Poll<(), Self::Error> {
-        let not_ready = self.a.poll_ready()?.is_not_ready();
-        if self.b.get_mut().poll_ready()?.is_not_ready() || not_ready {
-            Ok(Async::NotReady)
+    fn poll_ready(&mut self) -> Poll<Result<(), Self::Error>> {
+        let not_ready = !self.a.poll_ready().is_ready();
+        if !self.b.get_mut().poll_ready().is_ready() || not_ready {
+            Poll::Pending
         } else {
-            Ok(Async::Ready(()))
+            Poll::Ready(Ok(()))
         }
     }
 
@@ -84,26 +86,25 @@ where
 }
 
 impl<A, B> Future for AndThenFuture<A, B>
-where
-    A: Service,
-    B: Service<Request = A::Response, Error = A::Error>,
+    where
+        A: Service,
+        B: Service<Request = A::Response, Error = A::Error>,
 {
-    type Item = B::Response;
-    type Error = A::Error;
+    type Output = Result<B::Response, A::Error>;
 
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         if let Some(ref mut fut) = self.fut_b {
-            return fut.poll();
+            return fut.try_poll();
         }
 
-        match self.fut_a.as_mut().expect("Bug in actix-service").poll() {
-            Ok(Async::Ready(resp)) => {
+        match self.fut_a.as_mut().expect("Bug in actix-service").try_poll() {
+            Poll::Ready(Ok(resp)) => {
                 let _ = self.fut_a.take();
                 self.fut_b = Some(self.b.get_mut().call(resp));
-                self.poll()
+                self.try_poll()
             }
-            Ok(Async::NotReady) => Ok(Async::NotReady),
-            Err(err) => Err(err),
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
         }
     }
 }
@@ -205,37 +206,39 @@ where
     A: NewService,
     B: NewService<Request = A::Response, Error = A::Error, InitError = A::InitError>,
 {
-    type Item = AndThen<A::Service, B::Service>;
-    type Error = A::InitError;
+    type Output = Result<AndThen<A::Service, B::Service>, A::InitError>;
 
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+    fn poll(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Self::Output> {
         if self.a.is_none() {
-            if let Async::Ready(service) = self.fut_a.poll()? {
-                self.a = Some(service);
+            if let Poll::Ready(service) = self.fut_a.try_poll() {
+                self.a = Some(service?);
             }
         }
 
         if self.b.is_none() {
-            if let Async::Ready(service) = self.fut_b.poll()? {
-                self.b = Some(service);
+            if let Poll::Ready(service) = self.fut_b.try_poll() {
+                self.b = Some(service?);
             }
         }
 
         if self.a.is_some() && self.b.is_some() {
-            Ok(Async::Ready(AndThen::new(
+            Poll::Ready(Ok(AndThen::new(
                 self.a.take().unwrap(),
                 self.b.take().unwrap(),
             )))
         } else {
-            Ok(Async::NotReady)
+            Poll::Pending
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use futures::future::{ok, FutureResult};
-    use futures::{Async, Poll};
+    use futures::future::{ok, Ready};
+    use futures::{Poll};
     use std::cell::Cell;
     use std::rc::Rc;
 
@@ -247,11 +250,11 @@ mod tests {
         type Request = &'static str;
         type Response = &'static str;
         type Error = ();
-        type Future = FutureResult<Self::Response, ()>;
+        type Future = Ready<Result<Self::Response, ()>>;
 
-        fn poll_ready(&mut self) -> Poll<(), Self::Error> {
+        fn poll_ready(&mut self) -> Poll<Result<(), Self::Error>> {
             self.0.set(self.0.get() + 1);
-            Ok(Async::Ready(()))
+            Poll::Ready(Ok(()))
         }
 
         fn call(&mut self, req: &'static str) -> Self::Future {
@@ -266,11 +269,11 @@ mod tests {
         type Request = &'static str;
         type Response = (&'static str, &'static str);
         type Error = ();
-        type Future = FutureResult<Self::Response, ()>;
+        type Future = Ready<Result<Self::Response, ()>>;
 
-        fn poll_ready(&mut self) -> Poll<(), Self::Error> {
+        fn poll_ready(&mut self) -> Poll<Result<(), Self::Error>> {
             self.0.set(self.0.get() + 1);
-            Ok(Async::Ready(()))
+            Poll::Ready(Ok(()))
         }
 
         fn call(&mut self, req: &'static str) -> Self::Future {
@@ -283,8 +286,7 @@ mod tests {
         let cnt = Rc::new(Cell::new(0));
         let mut srv = Srv1(cnt.clone()).and_then(Srv2(cnt.clone()));
         let res = srv.poll_ready();
-        assert!(res.is_ok());
-        assert_eq!(res.unwrap(), Async::Ready(()));
+        assert_eq!(res, Poll::Ready(Ok(())));
         assert_eq!(cnt.get(), 2);
     }
 
@@ -292,9 +294,8 @@ mod tests {
     fn test_call() {
         let cnt = Rc::new(Cell::new(0));
         let mut srv = Srv1(cnt.clone()).and_then(Srv2(cnt));
-        let res = srv.call("srv1").poll();
-        assert!(res.is_ok());
-        assert_eq!(res.unwrap(), Async::Ready(("srv1", "srv2")));
+        let res = srv.call("srv1").try_poll();
+        assert_eq!(res, Poll::Ready(Ok(("srv1", "srv2"))));
     }
 
     #[test]
@@ -305,10 +306,9 @@ mod tests {
         let new_srv = blank
             .into_new_service()
             .and_then(move || Ok(Srv2(cnt.clone())));
-        if let Async::Ready(mut srv) = new_srv.new_service(&()).poll().unwrap() {
+        if let Poll::Ready(Ok(mut srv)) = new_srv.new_service(&()).try_poll() {
             let res = srv.call("srv1").poll();
-            assert!(res.is_ok());
-            assert_eq!(res.unwrap(), Async::Ready(("srv1", "srv2")));
+            assert_eq!(res, Poll::Ready(Ok(("srv1", "srv2"))));
         } else {
             panic!()
         }

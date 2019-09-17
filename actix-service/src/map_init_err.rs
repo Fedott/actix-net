@@ -1,8 +1,10 @@
 use std::marker::PhantomData;
 
-use futures::{Future, Poll};
+use futures::{TryFuture, Poll};
 
 use super::NewService;
+use std::pin::Pin;
+use futures::task::Context;
 
 /// `MapInitErr` service combinator
 pub struct MapInitErr<A, F, E> {
@@ -78,15 +80,18 @@ where
     }
 }
 
-impl<A, F, E> Future for MapInitErrFuture<A, F, E>
+impl<A, F, E> TryFuture for MapInitErrFuture<A, F, E>
 where
     A: NewService,
     F: Fn(A::InitError) -> E,
 {
-    type Item = A::Service;
+    type Ok = A::Service;
     type Error = E;
 
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        self.fut.poll().map_err(&self.f)
+    fn try_poll(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Self::Ok, Self::Error>> {
+        self.fut.try_poll().map_err(&self.f)
     }
 }

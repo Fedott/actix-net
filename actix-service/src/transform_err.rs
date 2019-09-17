@@ -1,8 +1,10 @@
 use std::marker::PhantomData;
 
-use futures::{Future, Poll};
+use futures::{TryFuture, Poll};
 
 use super::Transform;
+use std::pin::Pin;
+use futures::task::Context;
 
 /// Transform for the `map_err` combinator, changing the type of a new
 /// transform's init error.
@@ -73,16 +75,19 @@ where
     f: F,
 }
 
-impl<T, S, F, E> Future for TransformMapInitErrFuture<T, S, F, E>
+impl<T, S, F, E> TryFuture for TransformMapInitErrFuture<T, S, F, E>
 where
     T: Transform<S>,
     F: Fn(T::InitError) -> E + Clone,
 {
-    type Item = T::Transform;
+    type Ok = T::Transform;
     type Error = E;
 
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        self.fut.poll().map_err(&self.f)
+    fn try_poll(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Self::Ok, Self::Error>> {
+        self.fut.try_poll().map_err(&self.f)
     }
 }
 
@@ -148,15 +153,18 @@ where
     _t: PhantomData<E>,
 }
 
-impl<T, S, E> Future for TransformFromErrFuture<T, S, E>
+impl<T, S, E> TryFuture for TransformFromErrFuture<T, S, E>
 where
     T: Transform<S>,
     E: From<T::InitError>,
 {
-    type Item = T::Transform;
+    type Ok = T::Transform;
     type Error = E;
 
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        self.fut.poll().map_err(E::from)
+    fn try_poll(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Self::Ok, Self::Error>> {
+        self.fut.try_poll().map_err(E::from)
     }
 }

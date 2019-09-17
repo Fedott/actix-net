@@ -1,10 +1,12 @@
 use std::rc::Rc;
 
-use futures::{Async, Future, Poll};
+use futures::{Poll, TryFuture, Future};
 
 use crate::and_then::AndThen;
 use crate::from_err::FromErr;
 use crate::{NewService, Transform};
+use std::pin::Pin;
+use futures::task::Context;
 
 /// `Apply` new service combinator
 pub struct AndThenTransform<T, A, B> {
@@ -94,45 +96,49 @@ where
     T: Transform<B::Service, Request = A::Response, InitError = A::InitError>,
     T::Error: From<A::Error>,
 {
-    type Item = AndThen<FromErr<A::Service, T::Error>, T::Transform>;
-    type Error = T::InitError;
+    type Output = Result<AndThen<FromErr<A::Service, T::Error>, T::Transform>, T::InitError>;
 
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+    fn poll(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Self::Output> {
         if self.fut_t.is_none() {
-            if let Async::Ready(service) = self.fut_b.poll()? {
-                self.fut_t = Some(self.t_cell.new_transform(service));
+            if let Poll::Ready(service) = self.fut_b.try_poll() {
+                self.fut_t = Some(self.t_cell.new_transform(service?));
             }
         }
 
         if self.a.is_none() {
-            if let Async::Ready(service) = self.fut_a.poll()? {
-                self.a = Some(service);
+            if let Poll::Ready(service) = self.fut_a.poll() {
+                self.a = Some(service?);
             }
         }
 
         if let Some(ref mut fut) = self.fut_t {
-            if let Async::Ready(transform) = fut.poll()? {
-                self.t = Some(transform);
+            if let Poll::Ready(transform) = fut.try_poll() {
+                self.t = Some(transform?);
             }
         }
 
         if self.a.is_some() && self.t.is_some() {
-            Ok(Async::Ready(AndThen::new(
+            Poll::Ready(Ok(AndThen::new(
                 FromErr::new(self.a.take().unwrap()),
                 self.t.take().unwrap(),
             )))
         } else {
-            Ok(Async::NotReady)
+            Poll::Pending
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use futures::future::{ok, FutureResult};
-    use futures::{Async, Future, Poll};
+    use futures::future::{ok, Ready};
+    use futures::{Poll};
 
     use crate::{IntoNewService, IntoService, NewService, Service, ServiceExt};
+
+    type FutureResult<I, E> = Ready<Result<I, E>>;
 
     #[derive(Clone)]
     struct Srv;
@@ -142,8 +148,8 @@ mod tests {
         type Error = ();
         type Future = FutureResult<(), ()>;
 
-        fn poll_ready(&mut self) -> Poll<(), Self::Error> {
-            Ok(Async::Ready(()))
+        fn poll_ready(&mut self) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
         }
 
         fn call(&mut self, _: ()) -> Self::Future {
@@ -160,10 +166,10 @@ mod tests {
             .apply_fn(Srv, |req: &'static str, srv: &mut Srv| {
                 srv.call(()).map(move |res| (req, res))
             });
-        assert!(srv.poll_ready().is_ok());
-        let res = srv.call("srv").poll();
-        assert!(res.is_ok());
-        assert_eq!(res.unwrap(), Async::Ready(("srv", ())));
+        assert!(srv.poll_ready().is_ready());
+        let res = srv.call("srv").try_poll();
+        assert!(res.is_ready());
+        assert_eq!(res, Poll::Ready(Ok(("srv", ()))));
     }
 
     #[test]
@@ -174,11 +180,11 @@ mod tests {
             |req: &'static str, srv: &mut Srv| srv.call(()).map(move |res| (req, res)),
             || Ok(Srv),
         );
-        if let Async::Ready(mut srv) = new_srv.new_service(&()).poll().unwrap() {
-            assert!(srv.poll_ready().is_ok());
-            let res = srv.call("srv").poll();
-            assert!(res.is_ok());
-            assert_eq!(res.unwrap(), Async::Ready(("srv", ())));
+        if let Poll::Ready(Ok(mut srv)) = new_srv.new_service(&()).poll() {
+            assert!(srv.poll_ready().is_ready());
+            let res = srv.call("srv").try_poll();
+            assert!(res.is_ready());
+            assert_eq!(res, Poll::Ready(Ok(("srv", ()))));
         } else {
             panic!()
         }

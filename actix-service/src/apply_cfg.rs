@@ -1,10 +1,12 @@
 use std::marker::PhantomData;
 
-use futures::future::Future;
-use futures::{try_ready, Async, IntoFuture, Poll};
+use futures::future::TryFuture;
+use futures::{ready, Poll, Future};
 
 use crate::cell::Cell;
-use crate::{IntoService, NewService, Service};
+use crate::{IntoService, NewService, Service, IntoTryFuture};
+use std::pin::Pin;
+use futures::task::Context;
 
 /// Convert `Fn(&Config, &mut Service) -> Future<Service>` fn to a NewService
 pub fn apply_cfg<F, C, T, R, S>(
@@ -21,8 +23,8 @@ pub fn apply_cfg<F, C, T, R, S>(
 where
     F: FnMut(&C, &mut T) -> R,
     T: Service,
-    R: IntoFuture,
-    R::Item: IntoService<S>,
+    R: IntoTryFuture,
+    R::Ok: IntoService<S>,
     S: Service,
 {
     ApplyConfigService {
@@ -50,8 +52,8 @@ where
     F: FnMut(&C, &mut T::Service) -> R,
     T: NewService<Config = ()>,
     T::InitError: From<T::Error>,
-    R: IntoFuture<Error = T::InitError>,
-    R::Item: IntoService<S>,
+    R: IntoTryFuture<Error = T::InitError>,
+    R::Ok: IntoService<S>,
     S: Service,
 {
     ApplyConfigNewService {
@@ -66,8 +68,8 @@ struct ApplyConfigService<F, C, T, R, S>
 where
     F: FnMut(&C, &mut T) -> R,
     T: Service,
-    R: IntoFuture,
-    R::Item: IntoService<S>,
+    R: IntoTryFuture,
+    R::Ok: IntoService<S>,
     S: Service,
 {
     f: Cell<F>,
@@ -79,8 +81,8 @@ impl<F, C, T, R, S> Clone for ApplyConfigService<F, C, T, R, S>
 where
     F: FnMut(&C, &mut T) -> R,
     T: Service,
-    R: IntoFuture,
-    R::Item: IntoService<S>,
+    R: IntoTryFuture,
+    R::Ok: IntoService<S>,
     S: Service,
 {
     fn clone(&self) -> Self {
@@ -96,8 +98,8 @@ impl<F, C, T, R, S> NewService for ApplyConfigService<F, C, T, R, S>
 where
     F: FnMut(&C, &mut T) -> R,
     T: Service,
-    R: IntoFuture,
-    R::Item: IntoService<S>,
+    R: IntoTryFuture,
+    R::Ok: IntoService<S>,
     S: Service,
 {
     type Config = C;
@@ -112,7 +114,7 @@ where
     fn new_service(&self, cfg: &C) -> Self::Future {
         FnNewServiceConfigFut {
             fut: unsafe { (self.f.get_mut_unsafe())(cfg, self.srv.get_mut_unsafe()) }
-                .into_future(),
+                .into_try_future(),
             _t: PhantomData,
         }
     }
@@ -120,8 +122,8 @@ where
 
 struct FnNewServiceConfigFut<R, S>
 where
-    R: IntoFuture,
-    R::Item: IntoService<S>,
+    R: IntoTryFuture,
+    R::Ok: IntoService<S>,
     S: Service,
 {
     fut: R::Future,
@@ -130,15 +132,17 @@ where
 
 impl<R, S> Future for FnNewServiceConfigFut<R, S>
 where
-    R: IntoFuture,
-    R::Item: IntoService<S>,
+    R: IntoTryFuture,
+    R::Ok: IntoService<S>,
     S: Service,
 {
-    type Item = S;
-    type Error = R::Error;
+    type Output = Result<S, R::Error>;
 
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        Ok(Async::Ready(try_ready!(self.fut.poll()).into_service()))
+    fn poll(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Self::Output> {
+        Poll::Ready(Ok(ready!(self.fut.try_poll()?).into_service()))
     }
 }
 
@@ -148,8 +152,8 @@ where
     C: Clone,
     F: FnMut(&C, &mut T::Service) -> R,
     T: NewService<Config = ()>,
-    R: IntoFuture<Error = T::InitError>,
-    R::Item: IntoService<S>,
+    R: IntoTryFuture<Error = T::InitError>,
+    R::Ok: IntoService<S>,
     S: Service,
 {
     f: Cell<F>,
@@ -162,8 +166,8 @@ where
     C: Clone,
     F: FnMut(&C, &mut T::Service) -> R,
     T: NewService<Config = ()>,
-    R: IntoFuture<Error = T::InitError>,
-    R::Item: IntoService<S>,
+    R: IntoTryFuture<Error = T::InitError>,
+    R::Ok: IntoService<S>,
     S: Service,
 {
     fn clone(&self) -> Self {
@@ -181,8 +185,8 @@ where
     F: FnMut(&C, &mut T::Service) -> R,
     T: NewService<Config = ()>,
     T::InitError: From<T::Error>,
-    R: IntoFuture<Error = T::InitError>,
-    R::Item: IntoService<S>,
+    R: IntoTryFuture<Error = T::InitError>,
+    R::Ok: IntoService<S>,
     S: Service,
 {
     type Config = C;
@@ -212,8 +216,8 @@ where
     F: FnMut(&C, &mut T::Service) -> R,
     T: NewService<Config = ()>,
     T::InitError: From<T::Error>,
-    R: IntoFuture<Error = T::InitError>,
-    R::Item: IntoService<S>,
+    R: IntoTryFuture<Error = T::InitError>,
+    R::Ok: IntoService<S>,
     S: Service,
 {
     cfg: C,
@@ -230,37 +234,40 @@ where
     F: FnMut(&C, &mut T::Service) -> R,
     T: NewService<Config = ()>,
     T::InitError: From<T::Error>,
-    R: IntoFuture<Error = T::InitError>,
-    R::Item: IntoService<S>,
+    R: IntoTryFuture<Error = T::InitError>,
+    R::Ok: IntoService<S>,
     S: Service,
 {
-    type Item = S;
-    type Error = R::Error;
+    type Output = Result<S, R::Error>;
 
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+    fn poll(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Self::Output> {
         if let Some(ref mut fut) = self.srv_fut {
-            match fut.poll()? {
-                Async::NotReady => return Ok(Async::NotReady),
-                Async::Ready(srv) => {
+            match fut.try_poll() {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(srv) => {
+                    let srv = srv?;
                     let _ = self.srv_fut.take();
                     self.srv = Some(srv);
-                    return self.poll();
+                    return self.try_poll();
                 }
             }
         }
 
         if let Some(ref mut fut) = self.fut {
-            Ok(Async::Ready(try_ready!(fut.poll()).into_service()))
+            Poll::Ready(Ok(ready!(fut.try_poll()).into_service()))
         } else if let Some(ref mut srv) = self.srv {
-            match srv.poll_ready()? {
-                Async::NotReady => Ok(Async::NotReady),
-                Async::Ready(_) => {
-                    self.fut = Some(self.f.get_mut()(&self.cfg, srv).into_future());
-                    return self.poll();
+            match srv.poll_ready() {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(_) => {
+                    self.fut = Some(self.f.get_mut()(&self.cfg, srv).into_try_future());
+                    return self.try_poll();
                 }
             }
         } else {
-            Ok(Async::NotReady)
+            Poll::Pending
         }
     }
 }
